@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""
+FortiManager HTTPS JSON-RPC collector; no third party HTTP dependencies.
+"""
+import argparse
+import json
+import socket
+import ssl
+import sys
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+
+class APIError(Exception):
+    """
+    API transport, authentication or response validation failure.
+
+    Input:
+        Error message and optional exception arguments.
+
+    Output:
+        APIError instance.
+
+    """
+    pass
+
+
+class NoRedirect(HTTPRedirectHandler):
+    """
+    HTTP handler that prevents credential forwarding through redirects.
+
+    Input:
+        Constructor arguments supported by the base class.
+
+    Output:
+        NoRedirect instance.
+
+    """
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """
+        Decline redirects to avoid forwarding session credentials.
+
+        Input:
+            req: Original HTTP request.
+            fp: Response stream supplied by urllib.
+            code: HTTP redirect status code.
+            msg: Message to log or HTTP status text.
+            headers: HTTP response headers.
+            newurl: Redirect target supplied by the server.
+
+        Output:
+            None; urllib does not construct a redirected request.
+
+        """
+        # Never forward credentials or the session cookie to another endpoint.
+        return None
+
+
+class Client:
+    """
+    HTTPS JSON-RPC client with explicit session and error handling.
+
+    Input:
+        address: Target hostname or IP address without a scheme or path.
+        port: Target TCP port.
+        timeout: Maximum wait time in seconds.
+        verify: Whether to verify the TLS certificate and hostname.
+        ca_file: Optional path to a trusted CA certificate bundle.
+        api_token: Optional Bearer token; skips session login and logout.
+
+    Output:
+        Client instance.
+
+    """
+    def __init__(self, address, port=443, timeout=30, verify=True, ca_file=None, api_token=None):
+        """
+        Initialize the Client instance.
+
+        Input:
+            address: Target hostname or IP address without a scheme or path.
+            port: Target TCP port.
+            timeout: Maximum wait time in seconds.
+            verify: Whether to verify the TLS certificate and hostname.
+            ca_file: Optional path to a trusted CA certificate bundle.
+            api_token: Optional Bearer token; skips session login and logout.
+
+        Output:
+            None; initializes instance attributes for subsequent operations.
+
+        """
+        if any(c in address for c in '/@?#\r\n'):
+            raise APIError('Invalid API address: use a hostname or IP address')
+        host = '[' + address + ']' if ':' in address and not address.startswith('[') else address
+        self.base = f'https://{host}:{port}'
+        context = ssl.create_default_context(cafile=ca_file)
+        if not verify:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        self.opener = build_opener(ProxyHandler({}), HTTPSHandler(context=context), NoRedirect())
+        self.timeout = timeout
+        if api_token is not None and (not isinstance(api_token, str) or not api_token
+                                      or any(not 33 <= ord(c) <= 126 for c in api_token)):
+            raise APIError('Invalid API token')
+        self.api_token = api_token
+        self.session = None
+        self.request_id = 0
+
+    def call(self, url, method='get', data=None, gui=False, require_data=True):
+        """
+        Execute and validate a JSON-RPC or GUI proxy request.
+
+        Input:
+            url: API resource path.
+            method: JSON-RPC operation to execute.
+            data: Payload to process.
+            gui: Whether to use the GUI proxy envelope and session cookie.
+            require_data: Whether a response without data is an error.
+
+        Output:
+            Decoded result data; raises APIError for transport, status or response errors.
+
+        """
+        self.request_id += 1
+        param = {'url': url}
+        if data is not None:
+            param['data'] = data
+        # flatui_proxy accepts the GUI's flat envelope, not JSON-RPC params.
+        body = {'method': method, **param} if gui else {
+            'id': self.request_id, 'method': method, 'params': [param]}
+        headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+        if self.api_token:
+            headers['Authorization'] = 'Bearer ' + self.api_token
+        elif self.session:
+            if gui:
+                headers['Cookie'] = 'CURRENT_SESSION=' + self.session
+            else:
+                body['session'] = self.session
+        endpoint = '/cgi-bin/module/flatui_proxy' if gui else '/jsonrpc'
+        request = Request(self.base + endpoint, data=json.dumps(body).encode(), headers=headers, method='POST')
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                raw = response.read(16 * 1024 * 1024 + 1)
+            if len(raw) > 16 * 1024 * 1024:
+                raise APIError('API response exceeds 16 MiB')
+            payload = json.loads(raw)
+        except HTTPError as exc:
+            raise APIError(f'HTTP {exc.code} for {url}') from None
+        except (TimeoutError, socket.timeout):
+            raise APIError(f'Timeout for {url}') from None
+        except URLError as exc:
+            reason = 'TLS verification failed' if isinstance(exc.reason, ssl.SSLError) else 'Connection failed'
+            raise APIError(f'{reason} for {url}') from None
+        except (OSError, ValueError):
+            raise APIError(f'Invalid response or transport error for {url}') from None
+        if not isinstance(payload, dict) or payload.get('error') is not None:
+            raise APIError(f'JSON-RPC error for {url}')
+        results = payload.get('result')
+        if isinstance(results, dict):
+            results = [results]
+        if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
+            raise APIError(f'Missing API result for {url}')
+        result = results[0]
+        status = result.get('status')
+        if not isinstance(status, dict) or isinstance(status.get('code'), bool) or status.get('code') not in (0, '0'):
+            # Do not echo arbitrary server messages: they can contain credentials.
+            raise APIError(f'API returned a non-success or missing status for {url}')
+        if url == '/sys/login/user':
+            session = payload.get('session')
+            if not isinstance(session, str) or not session or any(c in session for c in '\r\n;'):
+                raise APIError('Authentication failed: missing or invalid session')
+            self.session = session
+        if require_data and ('data' not in result or result['data'] is None):
+            raise APIError(f'Missing API data for {url}')
+        return result.get('data')
+
+    def login(self, user, password):
+        """
+        Authenticate the API client and retain the resulting session.
+
+        Input:
+            user: Account name used for authentication.
+            password: Password used for authentication.
+
+        Output:
+            None; updates the client session or raises on authentication failure.
+
+        """
+        if self.api_token:
+            return
+        self.call('/sys/login/user', 'exec', {'user': user, 'passwd': password}, require_data=False)
+
+    def logout(self):
+        """
+        Close the API session and clear the local session identifier.
+
+        Input:
+            Current instance state.
+
+        Output:
+            None; clears the session even if the remote logout fails.
+
+        """
+        try:
+            if self.session:
+                self.call('/sys/logout', 'exec', require_data=False)
+        finally:
+            self.session = None
+
+
+def object_data(data):
+    """
+    Validate an API object, unwrapping a single-element list.
+
+    Input:
+        data: Payload to process.
+
+    Output:
+        Non-empty dictionary; raises APIError for an invalid response shape.
+
+    """
+    if isinstance(data, list) and len(data) == 1:
+        data = data[0]
+    if not isinstance(data, dict) or not data:
+        raise APIError('Expected a non-empty API object')
+    return data
+
+
+def list_data(data):
+    """
+    Validate a list of API objects.
+
+    Input:
+        data: Payload to process.
+
+    Output:
+        List of dictionaries; raises APIError if the payload has an invalid shape.
+
+    """
+    if not isinstance(data, list) or any(not isinstance(entry, dict) for entry in data):
+        raise APIError('Expected an API object list')
+    return data
+
+
+SYSTEM_KEYS = ('HA Mode', 'Hostname', 'Max Number of Admin Domains',
+               'Max Number of Device Groups', 'Platform Type', 'Serial Number', 'Version')
+
+
+def collect(client, user, password, exclude_adoms=()):
+    """
+    Collect monitoring data while preserving partial failures and closing the session.
+
+    Input:
+        client: Client used to obtain API or SSH data.
+        user: Account name used for authentication.
+        password: Password used for authentication.
+        exclude_adoms: Exact ADOM names to omit from device queries and discovery.
+
+    Output:
+        Section dictionary containing collected data and API error diagnostics.
+
+    """
+    token_mode = bool(getattr(client, 'api_token', None))
+    section = {key: {'disabled': 'GUI endpoints are unavailable with API token authentication'}
+               for key in ('license', 'resources')} if token_mode else {}
+    errors = []
+    try:
+        client.login(user, password)
+        for key, url, gui in (
+            ('system', '/sys/status', False),
+            ('license', '/gui/sys/license', True),
+            ('resources', '/gui/sys/resource/realtime', True),
+        ):
+            if token_mode and url.startswith('/gui/sys/'):
+                continue
+            try:
+                data = object_data(client.call(url, gui=gui))
+                if key == 'system':
+                    data = {k: data[k] for k in SYSTEM_KEYS if k in data}
+                elif key == 'license':
+                    data = {k: data[k] for k in ('current_num_dev', 'max_num_dev', 'dev_num_count', 'licenses') if k in data}
+                else:
+                    data = {k: data[k] for k in ('cpu_avg', 'disk', 'memory', 'memory_used', 'memory_total') if k in data}
+                section[key] = {'data': data}
+            except APIError as exc:
+                section[key] = {'error': str(exc)}
+                errors.append(str(exc))
+        try:
+            adoms = list_data(client.call('/dvmdb/adom'))
+            names = [entry.get('name') for entry in adoms]
+            if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
+                raise APIError('Invalid or duplicate ADOM name in API response')
+            excluded = sorted(set(names).intersection(exclude_adoms))
+            section['adoms'] = {'data': {}, 'excluded': excluded}
+            for name in names:
+                if name in excluded:
+                    continue
+                try:
+                    devices = list_data(client.call('/dvmdb/adom/' + quote(name, safe='') + '/device'))
+                    section['adoms']['data'][name] = {'count': len(devices)}
+                except APIError as exc:
+                    section['adoms']['data'][name] = {'error': str(exc)}
+                    errors.append(str(exc))
+        except APIError as exc:
+            section['adoms'] = {'error': str(exc)}
+            errors.append(str(exc))
+    except APIError as exc:
+        message = 'Authentication failed: ' + str(exc)
+        errors.append(message)
+        for key in ('system', 'license', 'resources', 'adoms'):
+            if not (token_mode and key in ('license', 'resources')):
+                section[key] = {'error': message}
+    finally:
+        try:
+            client.logout()
+        except APIError as exc:
+            errors.append('Logout failed: ' + str(exc))
+    section['api'] = {'errors': errors}
+    if token_mode:
+        section['api']['authentication'] = 'token'
+    return section
+
+
+def main(argv=None):
+    """
+    Run the special agent and emit Checkmk section data.
+
+    Input:
+        argv: Command-line arguments; None uses the process arguments.
+
+    Output:
+        Process exit status; writes collected sections to stdout and diagnostics to stderr.
+
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--address', required=True)
+    parser.add_argument('--port', type=int, default=443)
+    parser.add_argument('--user')
+    credentials = parser.add_mutually_exclusive_group(required=True)
+    credentials.add_argument('--password-id', help='Checkmk password reference ID:FILE')
+    credentials.add_argument('--api-token-id', help='Checkmk API token reference ID:FILE')
+    credentials.add_argument('--api-token-stdin', action='store_true', help='Read an API token from stdin')
+    credentials.add_argument('--password-stdin', action='store_true', help='Read a password from stdin for standalone tests')
+    parser.add_argument('--timeout', type=int, default=30)
+    parser.add_argument('--no-cert-check', action='store_true')
+    parser.add_argument('--ca-file')
+    parser.add_argument('--exclude-adom', action='append', default=[],
+                        help='Exclude an exact ADOM name; may be supplied more than once')
+    args = parser.parse_args(argv)
+    token_mode = bool(args.api_token_id or args.api_token_stdin)
+    if not token_mode and not args.user:
+        parser.error('--user is required for password authentication')
+    if not 1 <= args.port <= 65535 or args.timeout < 1:
+        parser.error('Invalid port or timeout')
+    try:
+        secret_id = args.api_token_id or args.password_id
+        if secret_id:
+            from cmk.utils.password_store import lookup
+            ident, path = secret_id.split(':', 1)
+            password = lookup(Path(path), ident)
+        else:
+            password = sys.stdin.readline().rstrip('\r\n')
+        if not password:
+            raise ValueError('Empty password')
+    except Exception:
+        print('FortiManager: cannot read authentication secret', file=sys.stderr)
+        return 1
+    try:
+        client = Client(args.address, args.port, args.timeout, not args.no_cert_check, args.ca_file,
+                        api_token=password if token_mode else None)
+        section = collect(client, args.user, password, args.exclude_adom)
+    except (APIError, OSError, ValueError):
+        print('FortiManager: invalid connection or TLS configuration', file=sys.stderr)
+        return 1
+    print('<<<fortimanager:sep(0)>>>')
+    print(json.dumps(section, ensure_ascii=True, separators=(',', ':')))
+    # Partial errors are represented in checks, keeping successful sections usable.
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
